@@ -78,7 +78,7 @@ def _universal(_coreai_program, tmp_path: Path):
 
 def test_one_copy_of_each_weight(_universal) -> None:
     program, universal = _universal
-    from coreai.authoring import AIModelAsset
+    from coreai.authoring import AIModelAsset  # noqa: PLC0415
 
     loaded = _asm(AIModelAsset.load(universal.path).program)
     resources = set(re.findall(r"resource_\d+", loaded))
@@ -91,7 +91,7 @@ def test_json_entry_per_placeholder(_universal) -> None:
     _, universal = _universal
     for scheme in _SCHEMES:
         ir = json.loads((universal.path / WEIGHT_TRANSFORMS_DIR / f"{scheme}.json").read_text())
-        assert ir["graph"] == f"main__{scheme}"
+        assert ir["graphs"] == {"main": f"main__{scheme}"}
         expected = {(t["id"], role) for t in ir["transforms"] for role in t["results"]}
         placeholders = _placeholders(_graph(universal.program, f"main__{scheme}"))
         actual = [
@@ -105,9 +105,9 @@ def test_json_entry_per_placeholder(_universal) -> None:
 @pytest.mark.parametrize("scheme", list(_SCHEMES))
 def test_refilled_graph_is_direct_twin(_universal, scheme: str, tmp_path: Path) -> None:
     """Filling the placeholders with coreai-opt's own values gives back the twin exactly."""
-    from coreai._compiler.dialects import coreai
-    from coreai._compiler.ir import InsertionPoint, StringAttr
-    from coreai.authoring import AIModelAsset
+    from coreai._compiler.dialects import coreai  # noqa: PLC0415
+    from coreai._compiler.ir import InsertionPoint, StringAttr  # noqa: PLC0415
+    from coreai.authoring import AIModelAsset  # noqa: PLC0415
 
     _, universal = _universal
     program = copy.deepcopy(universal.program)
@@ -118,7 +118,10 @@ def test_refilled_graph_is_direct_twin(_universal, scheme: str, tmp_path: Path) 
     removed = universal.schemes[scheme].removed_values
     sources = set()
     for placeholder in _placeholders(graph):
-        key = (placeholder.attributes[TRANSFORM_ID_ATTR].value, placeholder.attributes[RESULT_ATTR].value)
+        key = (
+            placeholder.attributes[TRANSFORM_ID_ATTR].value,
+            placeholder.attributes[RESULT_ATTR].value,
+        )
         sources.add(placeholder.operands[0].owner)
         with placeholder.context, placeholder.location, InsertionPoint(placeholder):
             constant = coreai.ConstantOp(value=removed[key])
@@ -134,3 +137,87 @@ def test_refilled_graph_is_direct_twin(_universal, scheme: str, tmp_path: Path) 
     refilled = _asm(AIModelAsset.load(tmp_path / "refilled.aimodel").program)
     twin = _asm(AIModelAsset.load(universal.twins[scheme]).program)
     assert refilled == twin
+
+
+_MULTI_FUNCTION = """
+coreai.graph private noinline @helper(%x: tensor<1x64xf16>) -> tensor<1x64xf16> {
+  %y = coreai.add %x, %x : (tensor<1x64xf16>, tensor<1x64xf16>) -> tensor<1x64xf16>
+  coreai.output %y : tensor<1x64xf16>
+}
+coreai.graph @main(%x: tensor<1x32xf16>) -> tensor<1x64xf16> {
+  %w = coreai.constant dense<WEIGHT> : tensor<32x64xf16>
+  %y = coreai.batch_matmul %x, %w : (tensor<1x32xf16>, tensor<32x64xf16>) -> tensor<1x64xf16>
+  %z = coreai.invoke @helper(%y) : (tensor<1x64xf16>) -> tensor<1x64xf16>
+  coreai.output %z : tensor<1x64xf16>
+}
+coreai.graph @prefill(%x: tensor<3x32xf16>) -> tensor<3x64xf16> {
+  %w = coreai.constant dense<WEIGHT> : tensor<32x64xf16>
+  %y = coreai.batch_matmul %x, %w : (tensor<3x32xf16>, tensor<32x64xf16>) -> tensor<3x64xf16>
+  coreai.output %y : tensor<3x64xf16>
+}
+"""
+
+
+def _parse_program(text: str, seed: int):
+    """An AIProgram from MLIR text whose `WEIGHT` is a seeded 32x64 fp16 literal."""
+    import numpy as np  # noqa: PLC0415
+    from coreai._compiler.ir import Module  # noqa: PLC0415
+    from coreai.authoring.asset import AIProgram  # noqa: PLC0415
+    from coreai.authoring.context import Context  # noqa: PLC0415
+
+    weight = np.random.default_rng(seed).standard_normal((32, 64)).astype(np.float16)
+    rows = ("[" + ", ".join(f"{v:.4f}" for v in row) + "]" for row in weight)
+    literal = "[" + ", ".join(rows) + "]"
+    module = Module.parse(text.replace("WEIGHT", literal), Context()._mlir_context)
+    return AIProgram._from_mlir_module(module)
+
+
+@pytest.mark.parametrize("scheme", ["w8", "lut4", "s50_w8"])
+def test_multi_function_program(scheme: str, tmp_path: Path) -> None:
+    """Every public graph gets a scheme copy; an unchanged callee stays shared."""
+    from coreai.authoring import AIModelAsset  # noqa: PLC0415
+
+    program = _parse_program(_MULTI_FUNCTION, seed=0)
+    universal = make_universal_asset(program, {scheme: _SCHEMES[scheme]}, tmp_path)
+    loaded = _asm(AIModelAsset.load(universal.path).program)
+    graph_names = re.findall(r"coreai\.graph (?:private noinline )?@(\w+)", loaded)
+    expected = ["helper", "main", "prefill", f"main__{scheme}", f"prefill__{scheme}"]
+    assert graph_names == expected
+    main_text = re.search(rf"coreai\.graph @main__{scheme}\(.*?\n}}", loaded, re.S).group(0)
+    assert "coreai.invoke @helper(" in main_text
+    ir = json.loads((universal.path / WEIGHT_TRANSFORMS_DIR / f"{scheme}.json").read_text())
+    assert ir["graphs"] == {"main": f"main__{scheme}", "prefill": f"prefill__{scheme}"}
+    ids = [t["id"] for t in ir["transforms"]]
+    assert ids == list(range(2)), ids
+    for name in ("main", "prefill"):
+        graph = _graph(universal.program, f"{name}__{scheme}")
+        assert _placeholders(graph)
+
+
+_CHANGED_CALLEE = """
+coreai.graph private noinline @helper(%x: tensor<1x32xf16>) -> tensor<1x64xf16> {
+  %w = coreai.constant dense<WEIGHT> : tensor<32x64xf16>
+  %y = coreai.batch_matmul %x, %w : (tensor<1x32xf16>, tensor<32x64xf16>) -> tensor<1x64xf16>
+  coreai.output %y : tensor<1x64xf16>
+}
+coreai.graph @main(%x: tensor<1x32xf16>) -> tensor<1x64xf16> {
+  %z = coreai.invoke @helper(%x) : (tensor<1x32xf16>) -> tensor<1x64xf16>
+  coreai.output %z : tensor<1x64xf16>
+}
+"""
+
+
+def test_changed_callee_gets_a_scheme_copy(tmp_path: Path) -> None:
+    """A callee whose weight the scheme compresses is cloned, and its caller calls the clone."""
+    from coreai.authoring import AIModelAsset  # noqa: PLC0415
+
+    program = _parse_program(_CHANGED_CALLEE, seed=1)
+    universal = make_universal_asset(program, {"w8": _SCHEMES["w8"]}, tmp_path)
+    loaded = _asm(AIModelAsset.load(universal.path).program)
+    graph_names = re.findall(r"coreai\.graph (?:private noinline )?@(\w+)", loaded)
+    assert graph_names == ["helper", "main", "helper__w8", "main__w8"]
+    ir = json.loads((universal.path / WEIGHT_TRANSFORMS_DIR / "w8.json").read_text())
+    assert ir["graphs"] == {"helper": "helper__w8", "main": "main__w8"}
+    main_text = re.search(r"coreai\.graph @main__w8\(.*?\n}", loaded, re.S).group(0)
+    assert "@helper__w8" in main_text and "@helper(" not in main_text
+    assert _placeholders(_graph(universal.program, "helper__w8"))
