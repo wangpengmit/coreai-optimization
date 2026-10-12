@@ -6,7 +6,7 @@
 """Universal assets: N compressed graphs that share one fp16 copy of the weights.
 
 Prototype 2a of the Universal Asset project (AOT graph transformation). For each
-scheme, the existing coreai-opt function rewrites a copy of the graph ahead of
+scheme, the existing coreai-opt function rewrites a copy of the program ahead of
 time. The weight constants it computed are then replaced by
 ``udml.placeholder "uasset.weight_transform"`` ops that read the fp16 source
 weight, and a JSON file per scheme (the IR) records how to recompute them. The
@@ -207,29 +207,20 @@ def defer_weights(
     eligible: list[tuple[Any, dict[str, Any]]],
     preexisting: set[Any],
     kernel: str,
-    scheme: str,
-    graph_name: str,
-) -> DeferredScheme:
+    deferred: DeferredScheme,
+) -> None:
     """Replace the weight-derived constants coreai-opt created in ``graph`` by placeholders.
 
     coreai-opt inserts each weight's compression chain right before the source
     constant and leaves the source dead. For each such source, every new leaf
     constant of its chain becomes a placeholder at the same position and location,
     except structural constants and splat zeros. The source is moved above the
-    chain so the placeholders can read it.
+    chain so the placeholders can read it. Transforms are appended to
+    ``deferred.ir["transforms"]``, so ids are unique across a scheme's graphs.
     """
     from coreai._compiler.dialects import udml  # noqa: PLC0415
     from coreai._compiler.ir import StringAttr  # noqa: PLC0415
 
-    deferred = DeferredScheme(
-        ir={
-            "ir": IR_NAME,
-            "version": IR_VERSION,
-            "scheme": scheme,
-            "graph": graph_name,
-            "transforms": [],
-        }
-    )
     for source, params in eligible:
         if len(list(source.result.uses)) != 0:
             continue  # coreai-opt skipped this weight.
@@ -271,7 +262,28 @@ def defer_weights(
         deferred.ir["transforms"].append(
             {"id": transform_id, "kernel": kernel, "params": params, "results": results}
         )
-    return deferred
+
+
+def _name(graph: Any) -> str:
+    return graph.attributes["sym_name"].value
+
+
+_SYMBOL_REF = re.compile(r'@"?([\w.$-]+)"?')
+
+
+def _callees(graph: Any) -> set[str]:
+    """Symbols that ``graph``'s ops reference, also inside other attributes
+    (``coreai.invoke`` wraps its callee in ``#param.constant<@callee>``)."""
+    callees = set()
+    for op in _iter_ops(graph):
+        attributes = op.attributes
+        for i in range(len(attributes)):
+            callees.update(_SYMBOL_REF.findall(str(attributes[i].attr)))
+    return callees
+
+
+def _is_public(graph: Any) -> bool:
+    return "priv" not in graph.attributes
 
 
 def make_universal_asset(
@@ -281,13 +293,24 @@ def make_universal_asset(
 ) -> UniversalAsset:
     """Write ``out_dir/universal.aimodel`` and each scheme's direct twin.
 
-    ``universal.aimodel`` holds the fp16 ``@main`` plus ``@main__<scheme>`` per
-    scheme, and ``weight_transforms/<scheme>.json``. ``out_dir/twins/<scheme>.aimodel``
-    is coreai-opt's direct output for the scheme, used for comparison.
+    ``universal.aimodel`` holds the fp16 program plus, per scheme, a
+    ``<graph>__<scheme>`` copy of every public graph and of every callee that
+    the scheme changes, and ``weight_transforms/<scheme>.json``.
+    ``out_dir/twins/<scheme>.aimodel`` is coreai-opt's direct output for the
+    scheme, used for comparison.
     """
-    graphs = _graphs(program)
-    if len(graphs) != 1 or graphs[0].attributes["sym_name"].value != "main":
-        raise ValueError("expected a program with a single graph named main")
+    import gc  # noqa: PLC0415
+
+    from coreai._compiler.ir import StringAttr, SymbolTable  # noqa: PLC0415
+
+    names = [_name(g) for g in _graphs(program)]
+    entries = [_name(g) for g in _graphs(program) if _is_public(g)]
+    if not entries:
+        raise ValueError("expected a program with a public graph")
+    for name in names:
+        # The pass treats `<graph>__<anything>` as a scheme graph, at any `__`.
+        if any(name[:i] in names for i in range(1, len(name)) if name.startswith("__", i)):
+            raise ValueError(f"graph name {name!r} looks like a scheme graph")
 
     universal = copy.deepcopy(program)
     universal_body_end = _graphs(universal)[-1]
@@ -304,27 +327,57 @@ def make_universal_asset(
         kw = _effective_kwargs(fn, kwargs)
 
         work = copy.deepcopy(program)
-        (graph,) = _graphs(work)
+        graphs = {_name(g): g for g in _graphs(work)}
         preexisting = set()
-        eligible = []
-        for op in _iter_ops(graph):
-            preexisting.add(op.operation)
-            if _should_compress_op(op, kw["weight_num_threshold"], _OPS_WEIGHT_NEED_COMPRESSION):
-                eligible.append((op, kernel.params(op, kw)))
+        eligible: dict[str, list[tuple[Any, dict[str, Any]]]] = {name: [] for name in graphs}
+        for name, graph in graphs.items():
+            for op in _iter_ops(graph):
+                preexisting.add(op.operation)
+                threshold = kw["weight_num_threshold"]
+                if _should_compress_op(op, threshold, _OPS_WEIGHT_NEED_COMPRESSION):
+                    eligible[name].append((op, kernel.params(op, kw)))
 
         fn(coreai_program=work, in_place=True, **kwargs)
         twins[scheme] = out_dir / "twins" / f"{scheme}.aimodel"
         work.save_asset(twins[scheme])
 
-        graph_name = f"main__{scheme}"
-        deferred = defer_weights(graph, eligible, preexisting, kernel.name, scheme, graph_name)
-        from coreai._compiler.ir import StringAttr  # noqa: PLC0415
-
-        with graph.context:
-            graph.attributes["sym_name"] = StringAttr.get(graph_name)
-        graph.move_after(universal_body_end)
-        universal_body_end = graph
+        # Callees whose weights the scheme left alone stay shared with the fp16 program.
+        changed = {
+            name
+            for name, sources in eligible.items()
+            if any(not list(source.result.uses) for source, _ in sources)
+        }
+        moved = [name for name in graphs if name in entries or name in changed]
+        for name, graph in graphs.items():
+            if name not in moved and _callees(graph) & (set(moved) - set(entries)):
+                raise NotImplementedError(
+                    f"unchanged graph {name!r} calls a callee that {scheme!r} changes"
+                )
+        deferred = DeferredScheme(
+            ir={
+                "ir": IR_NAME,
+                "version": IR_VERSION,
+                "scheme": scheme,
+                "graphs": {name: f"{name}__{scheme}" for name in moved},
+                "transforms": [],
+            }
+        )
+        for name in moved:
+            defer_weights(graphs[name], eligible[name], preexisting, kernel.name, deferred)
+        for name in moved:
+            graph = graphs[name]
+            with graph.context:
+                graph.attributes["sym_name"] = StringAttr.get(f"{name}__{scheme}")
+                for other in moved:
+                    SymbolTable.replace_all_symbol_uses(
+                        name, f"{name}__{scheme}", graphs[other].operation
+                    )
+        for name in moved:
+            graphs[name].move_after(universal_body_end)
+            universal_body_end = graphs[name]
         deferred_schemes[scheme] = deferred
+        del work, graphs, preexisting, eligible
+        gc.collect()
 
     path = out_dir / "universal.aimodel"
     universal.save_asset(path)
