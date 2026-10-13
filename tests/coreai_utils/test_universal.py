@@ -17,13 +17,7 @@ from coreai_opt.coreai_utils import (
     sparsify_weights,
 )
 from coreai_opt.coreai_utils.common import QScheme
-from coreai_opt.coreai_utils.universal import (
-    PLACEHOLDER_OPNAME,
-    RESULT_ATTR,
-    SCHEMES_ATTR,
-    TRANSFORM_ID_ATTR,
-    make_universal_asset,
-)
+from coreai_opt.coreai_utils.universal import SCHEMES_ATTR, make_universal_asset
 
 _SCHEMES = {
     "w8": (quantize_weights, {"dtype": DType.INT8}),
@@ -73,12 +67,16 @@ def _scheme_graphs(text: str) -> dict[str, str]:
     return dict(re.findall(r"(\w+) = @(\w+)", graphs))
 
 
-def _placeholders(graph):
-    return [
-        op
-        for op in graph.regions[0].blocks[0].operations
-        if op.name == "udml.placeholder" and op.attributes["opname"].value == PLACEHOLDER_OPNAME
-    ]
+def _virtual_constants(graph, scheme: str):
+    """(op, source key, transform id, role) of each constant whose value is a virtual resource."""
+    pattern = re.compile(rf"dense_resource<(\w+)\.{scheme}\.t(\d+)\.(\w+)>")
+    found = []
+    for op in graph.regions[0].blocks[0].operations:
+        if op.name == "coreai.constant":
+            match = pattern.match(str(op.attributes["value"]))
+            if match:
+                found.append((op, match.group(1), int(match.group(2)), match.group(3)))
+    return found
 
 
 @pytest.fixture
@@ -113,20 +111,39 @@ def test_scheme_entry_per_placeholder(_universal) -> None:
             str(t["id"]) for t in ir["transforms"]
         ]
         expected = {(t["id"], role) for t in ir["transforms"] for role in t["results"]}
-        placeholders = _placeholders(_graph(universal.program, f"main__{scheme}"))
-        actual = [
-            (op.attributes[TRANSFORM_ID_ATTR].value, op.attributes[RESULT_ATTR].value)
-            for op in placeholders
-        ]
+        virtual = _virtual_constants(_graph(universal.program, f"main__{scheme}"), scheme)
+        actual = [(transform_id, role) for _, _, transform_id, role in virtual]
         assert ir["transforms"], scheme
         assert sorted(actual) == sorted(expected)
+        assert not any(op.name == "udml.placeholder" for op in _iter_graph_ops(universal.program))
+
+
+def _iter_graph_ops(program):
+    for graph in program._module._mlir_module.body.operations:
+        yield from graph.regions[0].blocks[0].operations
+
+
+def test_derivations_in_resource_section(_universal) -> None:
+    """The saved asset shows how each virtual resource is computed."""
+    from coreai.authoring import AIModelAsset  # noqa: PLC0415
+
+    _, universal = _universal
+    loaded = _asm(AIModelAsset.load(universal.path).program)
+    resources = loaded.split("\n{-#\n")[1]
+    for scheme in _SCHEMES:
+        for _, source, transform_id, role in _virtual_constants(
+            _graph(universal.program, f"main__{scheme}"), scheme
+        ):
+            key = f"{source}.{scheme}.t{transform_id}.{role}"
+            derivation = rf"#coreai.derived_resource<@{scheme}::@t{transform_id}\[{role}\]"
+            pattern = rf'{re.escape(key)}: "{derivation}\({source} : tensor<'
+            assert re.search(pattern, resources), key
 
 
 @pytest.mark.parametrize("scheme", list(_SCHEMES))
 def test_refilled_graph_is_direct_twin(_universal, scheme: str, tmp_path: Path) -> None:
-    """Filling the placeholders with coreai-opt's own values gives back the twin exactly."""
-    from coreai._compiler.dialects import coreai  # noqa: PLC0415
-    from coreai._compiler.ir import InsertionPoint, StringAttr  # noqa: PLC0415
+    """Filling the virtual constants with coreai-opt's own values gives back the twin exactly."""
+    from coreai._compiler.ir import StringAttr  # noqa: PLC0415
     from coreai.authoring import AIModelAsset  # noqa: PLC0415
 
     _, universal = _universal
@@ -137,20 +154,10 @@ def test_refilled_graph_is_direct_twin(_universal, scheme: str, tmp_path: Path) 
             op.erase()
     del program._module._mlir_module.operation.attributes[SCHEMES_ATTR]
     removed = universal.schemes[scheme].removed_values
-    sources = set()
-    for placeholder in _placeholders(graph):
-        key = (
-            placeholder.attributes[TRANSFORM_ID_ATTR].value,
-            placeholder.attributes[RESULT_ATTR].value,
-        )
-        sources.add(placeholder.operands[0].owner)
-        with placeholder.context, placeholder.location, InsertionPoint(placeholder):
-            constant = coreai.ConstantOp(value=removed[key])
-        placeholder.results[0].replace_all_uses_with(constant.result)
-        placeholder.erase()
-    for source in sources:
-        assert not list(source.result.uses)
-        source.erase()
+    virtual = _virtual_constants(graph, scheme)
+    assert virtual
+    for op, _, transform_id, role in virtual:
+        op.attributes["value"] = removed[(transform_id, role)]
     with graph.context:
         graph.attributes["sym_name"] = StringAttr.get("main")
     program.save_asset(tmp_path / "refilled.aimodel")
@@ -211,11 +218,19 @@ def test_multi_function_program(scheme: str, tmp_path: Path) -> None:
         "main": f"main__{scheme}",
         "prefill": f"prefill__{scheme}",
     }
+    # Both functions read the same weight with the same parameters: one transform.
     ids = [t["id"] for t in universal.schemes[scheme].ir["transforms"]]
-    assert ids == list(range(2)), ids
-    for name in ("main", "prefill"):
-        graph = _graph(universal.program, f"{name}__{scheme}")
-        assert _placeholders(graph)
+    assert ids == [0], ids
+    keys = [
+        sorted(
+            f"{i}.{role}"
+            for _, _, i, role in _virtual_constants(
+                _graph(universal.program, f"{name}__{scheme}"), scheme
+            )
+        )
+        for name in ("main", "prefill")
+    ]
+    assert keys[0] and keys[0] == keys[1]
 
 
 _CHANGED_CALLEE = """
@@ -244,4 +259,52 @@ def test_changed_callee_gets_a_scheme_copy(tmp_path: Path) -> None:
     assert _scheme_graphs(schemes["w8"]) == {"helper": "helper__w8", "main": "main__w8"}
     main_text = re.search(r"coreai\.graph @main__w8\(.*?\n}", loaded, re.S).group(0)
     assert "@helper__w8" in main_text and "@helper(" not in main_text
-    assert _placeholders(_graph(universal.program, "helper__w8"))
+    assert _virtual_constants(_graph(universal.program, "helper__w8"), "w8")
+
+
+def _materialized_constants(module) -> list:
+    """The constant values of `module`'s w8 graph after materialization."""
+    from coreai._compiler.passmanager import PassManager  # noqa: PLC0415
+
+    from coreai_opt.coreai_utils._coreai_imports import (  # noqa: PLC0415
+        _get_constant_value_as_np_array,
+    )
+
+    PassManager.parse("builtin.module(coreai-materialize-weight-transforms{scheme=w8})").run(
+        module.operation
+    )
+    return [
+        _get_constant_value_as_np_array(op)
+        for graph in module.body.operations
+        for op in graph.regions[0].blocks[0].operations
+        if op.name == "coreai.constant"
+    ]
+
+
+def test_two_universal_assets_in_one_context(tmp_path: Path) -> None:
+    """A resource key has one meaning in a context, so two models' virtual keys must differ."""
+    import numpy as np  # noqa: PLC0415
+    from coreai._compiler.context import Context  # noqa: PLC0415
+    from coreai.authoring import AIModelAsset  # noqa: PLC0415
+
+    paths = [
+        make_universal_asset(
+            _parse_program(_MULTI_FUNCTION, seed=seed), {"w8": _SCHEMES["w8"]}, tmp_path / str(seed)
+        ).path
+        for seed in (0, 1)
+    ]
+    alone = []
+    for path in paths:
+        with Context()._mlir_context:
+            alone.append(
+                _materialized_constants(AIModelAsset.load(path).program._module._mlir_module)
+            )
+    with Context()._mlir_context:
+        modules = [AIModelAsset.load(path).program._module._mlir_module for path in paths]
+        together = [_materialized_constants(module) for module in modules]
+
+    assert not all(np.array_equal(a, b) for a, b in zip(*alone, strict=True))
+    for expected, actual in zip(alone, together, strict=True):
+        assert len(expected) == len(actual)
+        for a, b in zip(expected, actual, strict=True):
+            np.testing.assert_array_equal(a, b)

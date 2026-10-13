@@ -5,20 +5,23 @@
 
 """Universal assets: N compressed graphs that share one fp16 copy of the weights.
 
-Prototype 2a of the Universal Asset project (AOT graph transformation). For each
-scheme, the existing coreai-opt function rewrites a copy of the program ahead of
-time. The weight constants it computed are then replaced by
-``udml.placeholder "uasset.weight_transform"`` ops that read the fp16 source
-weight, and a ``#coreai.weight_transform_scheme`` attribute per scheme (the IR,
-in the module attribute ``coreai.weight_transform_schemes``) records how to
-recompute them. The compiler's ``coreai-materialize-weight-transforms`` pass
-executes it at JIT compile time.
+Prototype 3 of the Universal Asset project (virtual resources). For each scheme,
+the existing coreai-opt function rewrites a copy of the program ahead of time.
+The weight constants it computed then become virtual resources: each keeps its
+place, and its value is a ``dense_resource<<source>.<scheme>.t<id>.<role>>`` without
+data, whose ``#coreai.derived_resource`` (in the ``coreai`` resource group)
+computes it from the fp16 source resource. A ``#coreai.weight_transform_scheme``
+attribute per scheme (in the module attribute ``coreai.weight_transform_schemes``)
+holds the transforms. The compiler's ``coreai-materialize-weight-transforms``
+pass computes the data at JIT compile time.
 """
 
 from __future__ import annotations
 
 import copy
+import hashlib
 import inspect
+import json
 import re
 import warnings
 from collections.abc import Callable, Iterator
@@ -31,9 +34,8 @@ import numpy as np
 from coreai_opt.coreai_utils._coreai_imports import (
     AIProgram as _AIProgram,
     DenseElementsAttr as _DenseElementsAttr,
-    InsertionPoint as _InsertionPoint,
-    IntegerAttr as _IntegerAttr,
-    IntegerType as _IntegerType,
+    DenseResourceElementsAttr as _DenseResourceElementsAttr,
+    _get_constant_value_as_np_array,
 )
 from coreai_opt.coreai_utils._utils.graph_utils import (
     _infer_quantization_block_sizes,
@@ -50,9 +52,6 @@ from coreai_opt.coreai_utils.passes.weight_quantization import quantize_weights
 from coreai_opt.coreai_utils.passes.weight_sparsification import sparsify_weights
 
 SCHEMES_ATTR = "coreai.weight_transform_schemes"
-PLACEHOLDER_OPNAME = "uasset.weight_transform"
-TRANSFORM_ID_ATTR = "uasset.transform_id"
-RESULT_ATTR = "uasset.result"
 
 # The element type that a weight-transform parameter names for each `DType`.
 _DTYPE_TYPES = {
@@ -230,9 +229,11 @@ class DeferredScheme:
     """What ``defer_weights`` produced for one scheme."""
 
     ir: dict[str, Any]
-    # Value attribute of every constant replaced by a placeholder, keyed by
-    # (transform id, role). Lets tests rebuild the direct twin exactly.
+    # Value attribute of every constant that became a virtual resource, keyed
+    # by (transform id, role). Lets tests rebuild the direct twin exactly.
     removed_values: dict[tuple[int, str], Any] = field(default_factory=dict)
+    # Transform id of each distinct (source resource, source type, parameters).
+    transform_ids: dict[tuple[str, str, str], int] = field(default_factory=dict)
 
 
 @dataclass
@@ -277,19 +278,29 @@ def defer_weights(
     preexisting: set[Any],
     kernel: str,
     deferred: DeferredScheme,
+    source_keys: dict[Any, str],
 ) -> None:
-    """Replace the weight-derived constants coreai-opt created in ``graph`` by placeholders.
+    """Turn the weight-derived constants coreai-opt created in ``graph`` into virtual resources.
 
     coreai-opt inserts each weight's compression chain right before the source
     constant and leaves the source dead. For each such source, every new leaf
-    constant of its chain becomes a placeholder at the same position and location,
-    except structural constants and splat zeros. The source is moved above the
-    chain so the placeholders can read it. Transforms are appended to
-    ``deferred.ir["transforms"]``, so ids are unique across a scheme's graphs.
+    constant of its chain keeps its position and location, but its value becomes
+    ``dense_resource<<source>.<scheme>.t<id>.<role>>`` without data, which a
+    ``#coreai.derived_resource`` computes from the source resource. Structural
+    constants and splat zeros stay, and the dead source is erased.
+    ``source_keys`` maps each source op to its fp16 resource. A transform id
+    covers one distinct (source resource, source type, parameters) of the
+    scheme, so graphs that share a weight share its virtual resources. A
+    resource key has one meaning in a context; the source key is a content
+    hash, so the virtual keys of two models do not collide.
     """
-    from coreai._compiler.dialects import udml  # noqa: PLC0415
-    from coreai._compiler.ir import StringAttr  # noqa: PLC0415
+    from coreai._compiler._mlir_libs._coreaiIR._bindings import compiler  # noqa: PLC0415
+    from coreai._compiler.ir import Attribute  # noqa: PLC0415
 
+    scheme = deferred.ir["scheme"]
+    # Find every chain first: a chain ends at the previous original op, so the
+    # sources must stay until all chains are known.
+    chains = []
     for source, params in eligible:
         if len(list(source.result.uses)) != 0:
             continue  # coreai-opt skipped this weight.
@@ -299,38 +310,66 @@ def defer_weights(
         while index > 0 and block_ops[index - 1].operation not in preexisting:
             index -= 1
             chain.insert(0, block_ops[index])
-        if not chain:
-            continue
-        transform_id = len(deferred.ir["transforms"])
-        results: list[str] = []
-        first_placeholder = None
-        for op in chain:
-            if op.name != "coreai.constant":
-                continue
+        constants = [
+            op
+            for op in chain
+            if op.name == "coreai.constant"
+            and _role(op) not in _INLINE_ROLES
+            and not _is_splat_zero(op.attributes["value"])
+        ]
+        if constants:
+            chains.append((source, params, constants))
+
+    for source, params, constants in chains:
+        source_key = source_keys[source.operation]
+        transform_key = (source_key, str(source.result.type), json.dumps(params, sort_keys=True))
+        transform_id = deferred.transform_ids.get(transform_key)
+        if transform_id is None:
+            transform_id = len(deferred.ir["transforms"])
+            deferred.transform_ids[transform_key] = transform_id
+            deferred.ir["transforms"].append(
+                {"id": transform_id, "kernel": kernel, "params": params, "results": []}
+            )
+        results = deferred.ir["transforms"][transform_id]["results"]
+        for op in constants:
             role = _role(op)
-            value = op.attributes["value"]
-            if role in _INLINE_ROLES or _is_splat_zero(value):
-                continue
-            with op.context, op.location, _InsertionPoint(op):
-                placeholder = udml.PlaceholderOp(
-                    [op.result.type], PLACEHOLDER_OPNAME, [source.result]
+            derivation = (
+                f"#coreai.derived_resource<@{scheme}::@t{transform_id}[{role}]"
+                f"({source_key} : {source.result.type})>"
+            )
+            deferred.removed_values[(transform_id, role)] = op.attributes["value"]
+            with op.context, op.location:
+                op.attributes["value"] = compiler.declare_virtual_resource(
+                    type=op.result.type,
+                    key=f"{source_key}.{scheme}.t{transform_id}.{role}",
+                    derivation=Attribute.parse(derivation),
                 )
-                placeholder.attributes[TRANSFORM_ID_ATTR] = _IntegerAttr.get(
-                    _IntegerType.get_signless(64), transform_id
-                )
-                placeholder.attributes[RESULT_ATTR] = StringAttr.get(role)
-            op.result.replace_all_uses_with(placeholder.results[0])
-            op.erase()
-            deferred.removed_values[(transform_id, role)] = value
-            results.append(role)
-            if first_placeholder is None:
-                first_placeholder = placeholder
-        if first_placeholder is None:
-            continue
-        source.operation.move_before(first_placeholder.operation)
-        deferred.ir["transforms"].append(
-            {"id": transform_id, "kernel": kernel, "params": params, "results": results}
-        )
+            if role not in results:
+                results.append(role)
+    for source, _, _ in chains:
+        source.operation.erase()
+
+
+_RESOURCE_KEY = re.compile(r"dense_resource<([\w.$-]+)>")
+
+
+def _source_resource(fp16_op: Any, inline_resources: dict[Any, Any]) -> str:
+    """The resource key of an fp16 weight. A derivation names its source by key,
+    so an inline weight becomes a resource with the same data. Its key is a
+    content hash, like the keys of the other weights."""
+    value = fp16_op.attributes["value"]
+    match = _RESOURCE_KEY.match(str(value))
+    if match:
+        return match.group(1)
+    if value not in inline_resources:
+        data = np.ascontiguousarray(_get_constant_value_as_np_array(fp16_op))
+        key = f"uasset_source_{hashlib.sha256(data.tobytes()).hexdigest()[:20]}"
+        with fp16_op.context:
+            inline_resources[value] = _DenseResourceElementsAttr.get_from_buffer(
+                data, key, fp16_op.result.type
+            )
+    fp16_op.attributes["value"] = inline_resources[value]
+    return _RESOURCE_KEY.match(str(inline_resources[value])).group(1)
 
 
 def _name(graph: Any) -> str:
@@ -384,6 +423,8 @@ def make_universal_asset(
             raise ValueError(f"graph name {name!r} looks like a scheme graph")
 
     universal = copy.deepcopy(program)
+    fp16_graphs = {_name(g): g for g in _graphs(universal)}
+    inline_resources: dict[Any, Any] = {}
     universal_body_end = _graphs(universal)[-1]
     twins: dict[str, Path] = {}
     deferred_schemes: dict[str, DeferredScheme] = {}
@@ -401,12 +442,15 @@ def make_universal_asset(
         graphs = {_name(g): g for g in _graphs(work)}
         preexisting = set()
         eligible: dict[str, list[tuple[Any, dict[str, Any]]]] = {name: [] for name in graphs}
+        source_keys: dict[Any, str] = {}
         for name, graph in graphs.items():
-            for op in _iter_ops(graph):
+            # The fp16 graph of the universal program holds each source weight.
+            for op, fp16_op in zip(_iter_ops(graph), _iter_ops(fp16_graphs[name]), strict=True):
                 preexisting.add(op.operation)
                 threshold = kw["weight_num_threshold"]
                 if _should_compress_op(op, threshold, _OPS_WEIGHT_NEED_COMPRESSION):
                     eligible[name].append((op, kernel.params(op, kw)))
+                    source_keys[op.operation] = _source_resource(fp16_op, inline_resources)
 
         fn(coreai_program=work, in_place=True, **kwargs)
         twins[scheme] = out_dir / "twins" / f"{scheme}.aimodel"
@@ -433,7 +477,9 @@ def make_universal_asset(
             }
         )
         for name in moved:
-            defer_weights(graphs[name], eligible[name], preexisting, kernel.name, deferred)
+            defer_weights(
+                graphs[name], eligible[name], preexisting, kernel.name, deferred, source_keys
+            )
         for name in moved:
             graph = graphs[name]
             with graph.context:
@@ -461,10 +507,7 @@ def make_universal_asset(
 
 
 __all__ = [
-    "PLACEHOLDER_OPNAME",
-    "RESULT_ATTR",
     "SCHEMES_ATTR",
-    "TRANSFORM_ID_ATTR",
     "DeferredScheme",
     "Scheme",
     "UniversalAsset",
