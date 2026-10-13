@@ -9,16 +9,16 @@ Prototype 2a of the Universal Asset project (AOT graph transformation). For each
 scheme, the existing coreai-opt function rewrites a copy of the program ahead of
 time. The weight constants it computed are then replaced by
 ``udml.placeholder "uasset.weight_transform"`` ops that read the fp16 source
-weight, and a JSON file per scheme (the IR) records how to recompute them. The
-compiler's ``coreai-materialize-weight-transforms`` pass executes that JSON at
-JIT compile time.
+weight, and a ``#coreai.weight_transform_scheme`` attribute per scheme (the IR,
+in the module attribute ``coreai.weight_transform_schemes``) records how to
+recompute them. The compiler's ``coreai-materialize-weight-transforms`` pass
+executes it at JIT compile time.
 """
 
 from __future__ import annotations
 
 import copy
 import inspect
-import json
 import re
 import warnings
 from collections.abc import Callable, Iterator
@@ -49,12 +49,25 @@ from coreai_opt.coreai_utils.passes.weight_palettization import palettize_weight
 from coreai_opt.coreai_utils.passes.weight_quantization import quantize_weights
 from coreai_opt.coreai_utils.passes.weight_sparsification import sparsify_weights
 
-IR_NAME = "coreai.weight_transforms"
-IR_VERSION = 1
+SCHEMES_ATTR = "coreai.weight_transform_schemes"
 PLACEHOLDER_OPNAME = "uasset.weight_transform"
 TRANSFORM_ID_ATTR = "uasset.transform_id"
 RESULT_ATTR = "uasset.result"
-WEIGHT_TRANSFORMS_DIR = "weight_transforms"
+
+# The element type that a weight-transform parameter names for each `DType`.
+_DTYPE_TYPES = {
+    DType.INT2: "si2",
+    DType.UINT2: "ui2",
+    DType.INT4: "si4",
+    DType.UINT4: "ui4",
+    DType.INT8: "si8",
+    DType.UINT8: "ui8",
+    DType.FP4_E2M1FN: "f4E2M1FN",
+    DType.FP8_E4M3FN: "f8E4M3FN",
+    DType.FP8_E5M2: "f8E5M2",
+    DType.FP8_E8M0FNU: "f8E8M0FNU",
+}
+_DTYPE_PARAMS = frozenset({"dtype", "scale_dtype", "lut_dtype", "quantize_dtype"})
 
 # A scheme is a coreai-opt compression function plus its keyword arguments.
 Scheme = tuple[Callable[..., _AIProgram], dict[str, Any]]
@@ -154,6 +167,62 @@ _KERNELS: dict[Callable[..., Any], _Kernel] = {
     palettize_weights: _Kernel("palettize", _palettize_params),
     sparsify_weights: _Kernel("sparsify", _sparsify_params),
 }
+
+
+def _mlir_string(text: str) -> str:
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _mlir_attr(value: Any) -> str:
+    """``value`` (a coreai-opt option or parameter) in MLIR attribute syntax."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):  # Includes coreai-opt's string enums.
+        return _mlir_string(str(value))
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return f"{value:.17e} : f64"
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_mlir_attr(v) for v in value) + "]"
+    raise TypeError(f"cannot write {value!r} as an attribute")
+
+
+def _mlir_dict(entries: dict[str, str]) -> str:
+    return "{" + ", ".join(f"{_mlir_string(k)} = {v}" for k, v in entries.items()) + "}"
+
+
+def _params_attr(params: dict[str, Any]) -> str:
+    """A transform's parameters: dtypes as element types, the qscheme and numpy's
+    percentile behavior as flags, and no entry for None."""
+    entries = {}
+    for key, value in params.items():
+        if value is None:
+            continue
+        if key in _DTYPE_PARAMS:
+            entries[key] = _DTYPE_TYPES[DType(value)]
+        elif key == "qscheme":
+            entries["symmetric"] = _mlir_attr(QScheme(value) == QScheme.SYMMETRIC)
+        elif key == "percentile_index_dtype":
+            entries["percentile_index_in_weight_type"] = _mlir_attr(value == "weight")
+        else:
+            entries[key] = _mlir_attr(value)
+    return _mlir_dict(entries)
+
+
+def _scheme_attr(ir: dict[str, Any]) -> str:
+    """The ``#coreai.weight_transform_scheme`` attribute of one scheme's IR."""
+    graphs = {entry: "@" + _mlir_string(graph) for entry, graph in ir["graphs"].items()}
+    options = {k: _mlir_attr(v) for k, v in ir["options"].items() if v is not None}
+    transforms = {
+        f"t{t['id']}": f"#coreai.weight_transform<{t['kernel']}, {_params_attr(t['params'])}>"
+        for t in ir["transforms"]
+    }
+    return (
+        f"#coreai.weight_transform_scheme<{_mlir_string(ir['scheme'])}, "
+        f"graphs = {_mlir_dict(graphs)}, options = {_mlir_dict(options)}, "
+        f"transforms = {_mlir_dict(transforms)}>"
+    )
 
 
 @dataclass
@@ -295,13 +364,15 @@ def make_universal_asset(
 
     ``universal.aimodel`` holds the fp16 program plus, per scheme, a
     ``<graph>__<scheme>`` copy of every public graph and of every callee that
-    the scheme changes, and ``weight_transforms/<scheme>.json``.
+    the scheme changes, and a ``#coreai.weight_transform_scheme`` in the module
+    attribute ``coreai.weight_transform_schemes``.
     ``out_dir/twins/<scheme>.aimodel`` is coreai-opt's direct output for the
     scheme, used for comparison.
     """
     import gc  # noqa: PLC0415
 
-    from coreai._compiler.ir import StringAttr, SymbolTable  # noqa: PLC0415
+    from coreai._compiler.ir import ArrayAttr, Attribute, StringAttr, SymbolTable  # noqa: PLC0415
+    from coreai.authoring.asset import OSVersion  # noqa: PLC0415
 
     names = [_name(g) for g in _graphs(program)]
     entries = [_name(g) for g in _graphs(program) if _is_public(g)]
@@ -355,10 +426,9 @@ def make_universal_asset(
                 )
         deferred = DeferredScheme(
             ir={
-                "ir": IR_NAME,
-                "version": IR_VERSION,
                 "scheme": scheme,
                 "graphs": {name: f"{name}__{scheme}" for name in moved},
+                "options": kw,
                 "transforms": [],
             }
         )
@@ -380,21 +450,21 @@ def make_universal_asset(
         gc.collect()
 
     path = out_dir / "universal.aimodel"
-    universal.save_asset(path)
-    ir_dir = path / WEIGHT_TRANSFORMS_DIR
-    ir_dir.mkdir(exist_ok=True)
-    for scheme, deferred in deferred_schemes.items():
-        (ir_dir / f"{scheme}.json").write_text(json.dumps(deferred.ir, indent=1) + "\n")
+    module = universal._module._mlir_module  # noqa: SLF001
+    with module.context:
+        module.operation.attributes[SCHEMES_ATTR] = ArrayAttr.get(
+            [Attribute.parse(_scheme_attr(d.ir)) for d in deferred_schemes.values()]
+        )
+    # The weight-transform attributes are experimental in the versioned dialect.
+    universal.save_asset(path, minimum_os=OSVersion._experimental)  # noqa: SLF001
     return UniversalAsset(path=path, twins=twins, schemes=deferred_schemes, program=universal)
 
 
 __all__ = [
-    "IR_NAME",
-    "IR_VERSION",
     "PLACEHOLDER_OPNAME",
     "RESULT_ATTR",
+    "SCHEMES_ATTR",
     "TRANSFORM_ID_ATTR",
-    "WEIGHT_TRANSFORMS_DIR",
     "DeferredScheme",
     "Scheme",
     "UniversalAsset",

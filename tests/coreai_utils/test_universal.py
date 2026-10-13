@@ -4,7 +4,6 @@
 # be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
 import copy
-import json
 import re
 from pathlib import Path
 
@@ -21,8 +20,8 @@ from coreai_opt.coreai_utils.common import QScheme
 from coreai_opt.coreai_utils.universal import (
     PLACEHOLDER_OPNAME,
     RESULT_ATTR,
+    SCHEMES_ATTR,
     TRANSFORM_ID_ATTR,
-    WEIGHT_TRANSFORMS_DIR,
     make_universal_asset,
 )
 
@@ -62,6 +61,18 @@ def _graph(program, name: str):
     raise KeyError(name)
 
 
+def _scheme_attrs(program) -> dict[str, str]:
+    """Each scheme's ``#coreai.weight_transform_scheme``, as text, by scheme name."""
+    schemes = program._module._mlir_module.operation.attributes[SCHEMES_ATTR]
+    texts = [str(attr) for attr in schemes]
+    return {re.match(r'#coreai.weight_transform_scheme<"(\w+)"', t).group(1): t for t in texts}
+
+
+def _scheme_graphs(text: str) -> dict[str, str]:
+    graphs = re.search(r"graphs = \{(.*?)\}", text).group(1)
+    return dict(re.findall(r"(\w+) = @(\w+)", graphs))
+
+
 def _placeholders(graph):
     return [
         op
@@ -87,11 +98,20 @@ def test_one_copy_of_each_weight(_universal) -> None:
     assert graph_names == ["main"] + [f"main__{s}" for s in _SCHEMES]
 
 
-def test_json_entry_per_placeholder(_universal) -> None:
+def test_scheme_entry_per_placeholder(_universal) -> None:
+    from coreai.authoring import AIModelAsset  # noqa: PLC0415
+
     _, universal = _universal
+    saved = _scheme_attrs(universal.program)
+    # The attribute survives the versioned asset unchanged.
+    assert _scheme_attrs(AIModelAsset.load(universal.path).program) == saved
+    assert list(saved) == list(_SCHEMES)
     for scheme in _SCHEMES:
-        ir = json.loads((universal.path / WEIGHT_TRANSFORMS_DIR / f"{scheme}.json").read_text())
-        assert ir["graphs"] == {"main": f"main__{scheme}"}
+        ir = universal.schemes[scheme].ir
+        assert _scheme_graphs(saved[scheme]) == {"main": f"main__{scheme}"}
+        assert re.findall(r"\bt(\d+) = #coreai.weight_transform<", saved[scheme]) == [
+            str(t["id"]) for t in ir["transforms"]
+        ]
         expected = {(t["id"], role) for t in ir["transforms"] for role in t["results"]}
         placeholders = _placeholders(_graph(universal.program, f"main__{scheme}"))
         actual = [
@@ -115,6 +135,7 @@ def test_refilled_graph_is_direct_twin(_universal, scheme: str, tmp_path: Path) 
     for op in list(program._module._mlir_module.body.operations):
         if op != graph:
             op.erase()
+    del program._module._mlir_module.operation.attributes[SCHEMES_ATTR]
     removed = universal.schemes[scheme].removed_values
     sources = set()
     for placeholder in _placeholders(graph):
@@ -185,9 +206,12 @@ def test_multi_function_program(scheme: str, tmp_path: Path) -> None:
     assert graph_names == expected
     main_text = re.search(rf"coreai\.graph @main__{scheme}\(.*?\n}}", loaded, re.S).group(0)
     assert "coreai.invoke @helper(" in main_text
-    ir = json.loads((universal.path / WEIGHT_TRANSFORMS_DIR / f"{scheme}.json").read_text())
-    assert ir["graphs"] == {"main": f"main__{scheme}", "prefill": f"prefill__{scheme}"}
-    ids = [t["id"] for t in ir["transforms"]]
+    schemes = _scheme_attrs(AIModelAsset.load(universal.path).program)
+    assert _scheme_graphs(schemes[scheme]) == {
+        "main": f"main__{scheme}",
+        "prefill": f"prefill__{scheme}",
+    }
+    ids = [t["id"] for t in universal.schemes[scheme].ir["transforms"]]
     assert ids == list(range(2)), ids
     for name in ("main", "prefill"):
         graph = _graph(universal.program, f"{name}__{scheme}")
@@ -216,8 +240,8 @@ def test_changed_callee_gets_a_scheme_copy(tmp_path: Path) -> None:
     loaded = _asm(AIModelAsset.load(universal.path).program)
     graph_names = re.findall(r"coreai\.graph (?:private noinline )?@(\w+)", loaded)
     assert graph_names == ["helper", "main", "helper__w8", "main__w8"]
-    ir = json.loads((universal.path / WEIGHT_TRANSFORMS_DIR / "w8.json").read_text())
-    assert ir["graphs"] == {"helper": "helper__w8", "main": "main__w8"}
+    schemes = _scheme_attrs(AIModelAsset.load(universal.path).program)
+    assert _scheme_graphs(schemes["w8"]) == {"helper": "helper__w8", "main": "main__w8"}
     main_text = re.search(r"coreai\.graph @main__w8\(.*?\n}", loaded, re.S).group(0)
     assert "@helper__w8" in main_text and "@helper(" not in main_text
     assert _placeholders(_graph(universal.program, "helper__w8"))
