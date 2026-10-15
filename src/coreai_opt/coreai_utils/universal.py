@@ -5,15 +5,22 @@
 
 """Universal assets: N compressed graphs that share one fp16 copy of the weights.
 
-Prototype 3 of the Universal Asset project (virtual resources). For each scheme,
-the existing coreai-opt function rewrites a copy of the program ahead of time.
-The weight constants it computed then become virtual resources: each keeps its
-place, and its value is a ``dense_resource<<source>.<scheme>.t<id>.<role>>`` without
-data, whose ``#coreai.derived_resource`` (in the ``coreai`` resource group)
-computes it from the fp16 source resource. A ``#coreai.weight_transform_scheme``
-attribute per scheme (in the module attribute ``coreai.weight_transform_schemes``)
-holds the transforms. The compiler's ``coreai-materialize-weight-transforms``
-pass computes the data at JIT compile time.
+Prototype 4 of the Universal Asset project (virtual resources, chosen by
+conditions). For each scheme, the existing coreai-opt function rewrites a copy
+of the program ahead of time. The weight constants it computed then become
+virtual resources: each keeps its place, and its value is a
+``dense_resource<<source>.<scheme>.t<id>.<role>>`` without data, whose
+``#coreai.derived_resource`` (in the ``coreai`` resource group) computes it from
+the fp16 source resource. A ``#coreai.weight_transform_scheme`` attribute per
+scheme (in the module attribute ``coreai.weight_transform_schemes``) holds the
+transforms.
+
+A ``param.if`` (coreai-torch's ``properties.select``) chooses the scheme: one
+case per scheme, by default when the app's ``compression_scheme`` property is
+the scheme's name, and an ``else`` case with the fp16 program. The compiler's
+``resolve-properties`` keeps one case, and its
+``coreai-materialize-weight-transforms`` pass then computes the data of the
+virtual resources at JIT compile time.
 """
 
 from __future__ import annotations
@@ -211,7 +218,6 @@ def _params_attr(params: dict[str, Any]) -> str:
 
 def _scheme_attr(ir: dict[str, Any]) -> str:
     """The ``#coreai.weight_transform_scheme`` attribute of one scheme's IR."""
-    graphs = {entry: "@" + _mlir_string(graph) for entry, graph in ir["graphs"].items()}
     options = {k: _mlir_attr(v) for k, v in ir["options"].items() if v is not None}
     transforms = {
         f"t{t['id']}": f"#coreai.weight_transform<{t['kernel']}, {_params_attr(t['params'])}>"
@@ -219,8 +225,7 @@ def _scheme_attr(ir: dict[str, Any]) -> str:
     }
     return (
         f"#coreai.weight_transform_scheme<{_mlir_string(ir['scheme'])}, "
-        f"graphs = {_mlir_dict(graphs)}, options = {_mlir_dict(options)}, "
-        f"transforms = {_mlir_dict(transforms)}>"
+        f"options = {_mlir_dict(options)}, transforms = {_mlir_dict(transforms)}>"
     )
 
 
@@ -376,20 +381,6 @@ def _name(graph: Any) -> str:
     return graph.attributes["sym_name"].value
 
 
-_SYMBOL_REF = re.compile(r'@"?([\w.$-]+)"?')
-
-
-def _callees(graph: Any) -> set[str]:
-    """Symbols that ``graph``'s ops reference, also inside other attributes
-    (``coreai.invoke`` wraps its callee in ``#param.constant<@callee>``)."""
-    callees = set()
-    for op in _iter_ops(graph):
-        attributes = op.attributes
-        for i in range(len(attributes)):
-            callees.update(_SYMBOL_REF.findall(str(attributes[i].attr)))
-    return callees
-
-
 def _is_public(graph: Any) -> bool:
     return "priv" not in graph.attributes
 
@@ -398,29 +389,39 @@ def make_universal_asset(
     program: _AIProgram,
     schemes: dict[str, Scheme],
     out_dir: Path,
+    conditions: dict[str, Any] | None = None,
 ) -> UniversalAsset:
     """Write ``out_dir/universal.aimodel`` and each scheme's direct twin.
 
-    ``universal.aimodel`` holds the fp16 program plus, per scheme, a
-    ``<graph>__<scheme>`` copy of every public graph and of every callee that
-    the scheme changes, and a ``#coreai.weight_transform_scheme`` in the module
-    attribute ``coreai.weight_transform_schemes``.
-    ``out_dir/twins/<scheme>.aimodel`` is coreai-opt's direct output for the
-    scheme, used for comparison.
+    ``universal.aimodel`` chooses its graphs with a ``param.if``: one case per
+    scheme, in order, then an ``else`` case with the fp16 program. A scheme's
+    case holds a copy of every graph of the program, under the same names,
+    whose compressed weights are virtual resources; graphs share each fp16
+    blob by key. The case's condition is ``conditions[scheme]``, a
+    ``coreai_torch.properties.when(...)``; by default,
+    ``when(compression_scheme=scheme)``. The module attribute
+    ``coreai.weight_transform_schemes`` holds a ``#coreai.weight_transform_scheme``
+    per scheme. ``out_dir/twins/<scheme>.aimodel`` is coreai-opt's direct output
+    for the scheme, used for comparison.
     """
     import gc  # noqa: PLC0415
 
     from coreai._compiler.ir import ArrayAttr, Attribute, StringAttr, SymbolTable  # noqa: PLC0415
     from coreai.authoring.asset import OSVersion  # noqa: PLC0415
+    from coreai_torch import properties  # noqa: PLC0415
 
+    others = {op.operation.name for op in _graphs(program)} - {"coreai.graph"}
+    if others:
+        # This function builds the param.if itself, and select can't nest one.
+        raise ValueError(f"expected a program of graphs only, got {sorted(others)}")
     names = [_name(g) for g in _graphs(program)]
-    entries = [_name(g) for g in _graphs(program) if _is_public(g)]
-    if not entries:
+    if not any(_is_public(g) for g in _graphs(program)):
         raise ValueError("expected a program with a public graph")
-    for name in names:
-        # The pass treats `<graph>__<anything>` as a scheme graph, at any `__`.
-        if any(name[:i] in names for i in range(1, len(name)) if name.startswith("__", i)):
-            raise ValueError(f"graph name {name!r} looks like a scheme graph")
+    if not schemes:
+        raise ValueError("expected at least one scheme")
+    conditions = dict(conditions or {})
+    if set(conditions) - set(schemes):
+        raise ValueError(f"conditions for unknown schemes {sorted(set(conditions) - set(schemes))}")
 
     universal = copy.deepcopy(program)
     fp16_graphs = {_name(g): g for g in _graphs(universal)}
@@ -429,12 +430,18 @@ def make_universal_asset(
     twins: dict[str, Path] = {}
     deferred_schemes: dict[str, DeferredScheme] = {}
     for scheme, (fn, kwargs) in schemes.items():
-        if not re.fullmatch(r"[A-Za-z0-9_]+", scheme):
-            raise ValueError(f"scheme name must be alphanumeric/underscore, got {scheme!r}")
+        if not re.fullmatch(r"[A-Za-z0-9_]+", scheme) or scheme == "none":
+            raise ValueError(
+                f"scheme name must be alphanumeric/underscore and not 'none', got {scheme!r}"
+            )
         if fn not in _KERNELS:
             raise ValueError(f"unsupported compression function {fn!r}")
         if "in_place" in kwargs or "coreai_program" in kwargs:
             raise ValueError("scheme kwargs must not set coreai_program or in_place")
+        # Until select puts it in its case, each graph of the scheme has a name of its own.
+        renamed = {name: f"{name}__{scheme}" for name in names}
+        if set(renamed.values()) & set(names):
+            raise ValueError(f"a graph name ends in '__{scheme}', the scheme's suffix")
         kernel = _KERNELS[fn]
         kw = _effective_kwargs(fn, kwargs)
 
@@ -456,41 +463,17 @@ def make_universal_asset(
         twins[scheme] = out_dir / "twins" / f"{scheme}.aimodel"
         work.save_asset(twins[scheme])
 
-        # Callees whose weights the scheme left alone stay shared with the fp16 program.
-        changed = {
-            name
-            for name, sources in eligible.items()
-            if any(not list(source.result.uses) for source, _ in sources)
-        }
-        moved = [name for name in graphs if name in entries or name in changed]
+        deferred = DeferredScheme(ir={"scheme": scheme, "options": kw, "transforms": []})
         for name, graph in graphs.items():
-            if name not in moved and _callees(graph) & (set(moved) - set(entries)):
-                raise NotImplementedError(
-                    f"unchanged graph {name!r} calls a callee that {scheme!r} changes"
-                )
-        deferred = DeferredScheme(
-            ir={
-                "scheme": scheme,
-                "graphs": {name: f"{name}__{scheme}" for name in moved},
-                "options": kw,
-                "transforms": [],
-            }
-        )
-        for name in moved:
-            defer_weights(
-                graphs[name], eligible[name], preexisting, kernel.name, deferred, source_keys
-            )
-        for name in moved:
-            graph = graphs[name]
+            defer_weights(graph, eligible[name], preexisting, kernel.name, deferred, source_keys)
+        for name, graph in graphs.items():
             with graph.context:
-                graph.attributes["sym_name"] = StringAttr.get(f"{name}__{scheme}")
-                for other in moved:
-                    SymbolTable.replace_all_symbol_uses(
-                        name, f"{name}__{scheme}", graphs[other].operation
-                    )
-        for name in moved:
-            graphs[name].move_after(universal_body_end)
-            universal_body_end = graphs[name]
+                graph.attributes["sym_name"] = StringAttr.get(renamed[name])
+                for other in graphs.values():
+                    SymbolTable.replace_all_symbol_uses(name, renamed[name], other.operation)
+        for graph in graphs.values():
+            graph.move_after(universal_body_end)
+            universal_body_end = graph
         deferred_schemes[scheme] = deferred
         del work, graphs, preexisting, eligible
         gc.collect()
@@ -501,7 +484,16 @@ def make_universal_asset(
         module.operation.attributes[SCHEMES_ATTR] = ArrayAttr.get(
             [Attribute.parse(_scheme_attr(d.ir)) for d in deferred_schemes.values()]
         )
-    # The weight-transform attributes are experimental in the versioned dialect.
+    cases = [
+        (
+            conditions.get(scheme) or properties.when(compression_scheme=scheme),
+            [(f"{name}__{scheme}", name) for name in names],
+        )
+        for scheme in schemes
+    ]
+    properties.select(universal, [*cases, (None, names)])
+    # The weight-transform attributes and the param ops are experimental in the
+    # versioned dialect.
     universal.save_asset(path, minimum_os=OSVersion._experimental)  # noqa: SLF001
     return UniversalAsset(path=path, twins=twins, schemes=deferred_schemes, program=universal)
 

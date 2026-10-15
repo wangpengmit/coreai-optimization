@@ -48,11 +48,25 @@ def _asm(program) -> str:
     return program._module._mlir_module.operation.get_asm(enable_debug_info=True)
 
 
-def _graph(program, name: str):
-    for op in program._module._mlir_module.body.operations:
-        if op.attributes["sym_name"].value == name:
-            return op
-    raise KeyError(name)
+def _choice(program):
+    """The program's one ``param.if``."""
+    (choice,) = [op for op in program._module._mlir_module.body.operations if op.name == "param.if"]
+    return choice
+
+
+def _cases(program, schemes) -> dict:
+    """The graphs of each case of the program's ``param.if``, by name, keyed by scheme;
+    ``None`` is the fp16 ``else`` case."""
+    choice = _choice(program)
+    keys = [*schemes, None]
+    assert len(choice.regions) == len(keys)
+    cases = {}
+    for key, region in zip(keys, choice.regions, strict=True):
+        (group,) = region.blocks[0].operations
+        cases[key] = {
+            op.attributes["sym_name"].value: op for op in group.regions[0].blocks[0].operations
+        }
+    return cases
 
 
 def _scheme_attrs(program) -> dict[str, str]:
@@ -60,11 +74,6 @@ def _scheme_attrs(program) -> dict[str, str]:
     schemes = program._module._mlir_module.operation.attributes[SCHEMES_ATTR]
     texts = [str(attr) for attr in schemes]
     return {re.match(r'#coreai.weight_transform_scheme<"(\w+)"', t).group(1): t for t in texts}
-
-
-def _scheme_graphs(text: str) -> dict[str, str]:
-    graphs = re.search(r"graphs = \{(.*?)\}", text).group(1)
-    return dict(re.findall(r"(\w+) = @(\w+)", graphs))
 
 
 def _virtual_constants(graph, scheme: str):
@@ -79,6 +88,20 @@ def _virtual_constants(graph, scheme: str):
     return found
 
 
+def _run(module, pipeline: str) -> None:
+    from coreai._compiler.passmanager import PassManager  # noqa: PLC0415
+
+    with module.context:
+        PassManager.parse(f"builtin.module({pipeline})").run(module.operation)
+
+
+def _resolve(program, scheme: str | None) -> None:
+    """Keep the case the compiler keeps for ``scheme`` (None: no scheme chosen)."""
+    _run(
+        program._module._mlir_module, f"resolve-properties{{compression-scheme={scheme or 'none'}}}"
+    )
+
+
 @pytest.fixture
 def _universal(_coreai_program, tmp_path: Path):
     program, _, _ = _coreai_program
@@ -89,14 +112,24 @@ def test_one_copy_of_each_weight(_universal) -> None:
     program, universal = _universal
     from coreai.authoring import AIModelAsset  # noqa: PLC0415
 
-    loaded = _asm(AIModelAsset.load(universal.path).program)
+    loaded_program = AIModelAsset.load(universal.path).program
+    loaded = _asm(loaded_program)
     resources = set(re.findall(r"resource_\d+", loaded))
     assert resources == set(re.findall(r"resource_\d+", _asm(program)))
-    graph_names = re.findall(r"coreai\.graph @(\w+)", loaded)
-    assert graph_names == ["main"] + [f"main__{s}" for s in _SCHEMES]
+    # Every case has the program's one graph, under its own name; no graph is outside them.
+    assert {key: list(graphs) for key, graphs in _cases(loaded_program, _SCHEMES).items()} == {
+        key: ["main"] for key in [*_SCHEMES, None]
+    }
+    assert not [
+        op
+        for op in loaded_program._module._mlir_module.body.operations
+        if op.name == "coreai.graph"
+    ]
+    for scheme in _SCHEMES:
+        assert f'param.check_property "compression_scheme" in ["{scheme}"]' in loaded
 
 
-def test_scheme_entry_per_placeholder(_universal) -> None:
+def test_scheme_entry_per_virtual_constant(_universal) -> None:
     from coreai.authoring import AIModelAsset  # noqa: PLC0415
 
     _, universal = _universal
@@ -104,23 +137,21 @@ def test_scheme_entry_per_placeholder(_universal) -> None:
     # The attribute survives the versioned asset unchanged.
     assert _scheme_attrs(AIModelAsset.load(universal.path).program) == saved
     assert list(saved) == list(_SCHEMES)
+    cases = _cases(universal.program, _SCHEMES)
     for scheme in _SCHEMES:
         ir = universal.schemes[scheme].ir
-        assert _scheme_graphs(saved[scheme]) == {"main": f"main__{scheme}"}
+        assert "graphs =" not in saved[scheme]
         assert re.findall(r"\bt(\d+) = #coreai.weight_transform<", saved[scheme]) == [
             str(t["id"]) for t in ir["transforms"]
         ]
         expected = {(t["id"], role) for t in ir["transforms"] for role in t["results"]}
-        virtual = _virtual_constants(_graph(universal.program, f"main__{scheme}"), scheme)
+        virtual = _virtual_constants(cases[scheme]["main"], scheme)
         actual = [(transform_id, role) for _, _, transform_id, role in virtual]
         assert ir["transforms"], scheme
         assert sorted(actual) == sorted(expected)
-        assert not any(op.name == "udml.placeholder" for op in _iter_graph_ops(universal.program))
-
-
-def _iter_graph_ops(program):
-    for graph in program._module._mlir_module.body.operations:
-        yield from graph.regions[0].blocks[0].operations
+    # The fp16 case has no virtual resource.
+    assert not any(_virtual_constants(cases[None]["main"], s) for s in _SCHEMES)
+    assert "udml.placeholder" not in _asm(universal.program)
 
 
 def test_derivations_in_resource_section(_universal) -> None:
@@ -130,10 +161,9 @@ def test_derivations_in_resource_section(_universal) -> None:
     _, universal = _universal
     loaded = _asm(AIModelAsset.load(universal.path).program)
     resources = loaded.split("\n{-#\n")[1]
+    cases = _cases(universal.program, _SCHEMES)
     for scheme in _SCHEMES:
-        for _, source, transform_id, role in _virtual_constants(
-            _graph(universal.program, f"main__{scheme}"), scheme
-        ):
+        for _, source, transform_id, role in _virtual_constants(cases[scheme]["main"], scheme):
             key = f"{source}.{scheme}.t{transform_id}.{role}"
             derivation = rf"#coreai.derived_resource<@{scheme}::@t{transform_id}\[{role}\]"
             pattern = rf'{re.escape(key)}: "{derivation}\({source} : tensor<'
@@ -142,29 +172,84 @@ def test_derivations_in_resource_section(_universal) -> None:
 
 @pytest.mark.parametrize("scheme", list(_SCHEMES))
 def test_refilled_graph_is_direct_twin(_universal, scheme: str, tmp_path: Path) -> None:
-    """Filling the virtual constants with coreai-opt's own values gives back the twin exactly."""
-    from coreai._compiler.ir import StringAttr  # noqa: PLC0415
+    """The case the compiler keeps for the scheme, with its virtual constants filled with
+    coreai-opt's own values, gives back the twin exactly."""
     from coreai.authoring import AIModelAsset  # noqa: PLC0415
 
     _, universal = _universal
     program = copy.deepcopy(universal.program)
-    graph = _graph(program, f"main__{scheme}")
-    for op in list(program._module._mlir_module.body.operations):
-        if op != graph:
-            op.erase()
+    _resolve(program, scheme)
+    assert "param." not in _asm(program)
     del program._module._mlir_module.operation.attributes[SCHEMES_ATTR]
+    (graph,) = program._module._mlir_module.body.operations
     removed = universal.schemes[scheme].removed_values
     virtual = _virtual_constants(graph, scheme)
     assert virtual
     for op, _, transform_id, role in virtual:
         op.attributes["value"] = removed[(transform_id, role)]
-    with graph.context:
-        graph.attributes["sym_name"] = StringAttr.get("main")
     program.save_asset(tmp_path / "refilled.aimodel")
 
     refilled = _asm(AIModelAsset.load(tmp_path / "refilled.aimodel").program)
     twin = _asm(AIModelAsset.load(universal.twins[scheme]).program)
     assert refilled == twin
+
+
+def test_no_scheme_keeps_the_fp16_program(_universal) -> None:
+    program, universal = _universal
+    resolved = copy.deepcopy(universal.program)
+    _resolve(resolved, None)
+    del resolved._module._mlir_module.operation.attributes[SCHEMES_ATTR]
+
+    def masked(p) -> str:
+        # An inline fp16 weight became a resource, so payloads and the resource section differ.
+        return re.sub(r"dense(_resource)?<[^>]*>", "<payload>", _asm(p).split("\n{-#\n")[0])
+
+    assert masked(resolved) == masked(program)
+
+
+def test_a_case_can_have_any_condition(_coreai_program, tmp_path: Path) -> None:
+    """A scheme can be chosen by the device, here by its preferred compute unit."""
+    from coreai_torch import properties  # noqa: PLC0415
+
+    program, _, _ = _coreai_program
+    schemes = {s: _SCHEMES[s] for s in ("w8", "lut4")}
+    universal = make_universal_asset(
+        program,
+        schemes,
+        tmp_path,
+        conditions={"w8": properties.when(preferred_compute_unit="neural-engine")},
+    )
+    text = _asm(universal.program)
+    assert 'param.check_property "preferred_compute_unit" in ["neural-engine"]' in text
+    assert 'param.check_property "compression_scheme" in ["lut4"]' in text
+    resolved = copy.deepcopy(universal.program)
+    _run(
+        resolved._module._mlir_module,
+        "resolve-properties{preferred-compute-unit=neural-engine compression-scheme=lut4}",
+    )
+    assert _virtual_constants(resolved._module._mlir_module.body.operations[0], "w8")
+
+
+def test_a_program_with_conditions_is_rejected(_coreai_program, tmp_path: Path) -> None:
+    """The function builds the param.if itself, so a program can't have one already."""
+    program, _, _ = _coreai_program
+    universal = make_universal_asset(program, {"w8": _SCHEMES["w8"]}, tmp_path / "first")
+    with pytest.raises(ValueError, match="graphs only"):
+        make_universal_asset(universal.program, {"w8": _SCHEMES["w8"]}, tmp_path / "second")
+
+
+@pytest.mark.parametrize(
+    ("schemes", "conditions", "error"),
+    [
+        ({"none": _SCHEMES["w8"]}, None, "not 'none'"),
+        ({}, None, "at least one scheme"),
+        ({"w8": _SCHEMES["w8"]}, {"lut4": None}, "unknown schemes"),
+    ],
+)
+def test_invalid_arguments(_coreai_program, tmp_path: Path, schemes, conditions, error) -> None:
+    program, _, _ = _coreai_program
+    with pytest.raises(ValueError, match=error):
+        make_universal_asset(program, schemes, tmp_path, conditions=conditions)
 
 
 _MULTI_FUNCTION = """
@@ -202,32 +287,24 @@ def _parse_program(text: str, seed: int):
 
 @pytest.mark.parametrize("scheme", ["w8", "lut4", "s50_w8"])
 def test_multi_function_program(scheme: str, tmp_path: Path) -> None:
-    """Every public graph gets a scheme copy; an unchanged callee stays shared."""
+    """Each case holds every graph, an unchanged callee too; graphs share a weight's transform."""
     from coreai.authoring import AIModelAsset  # noqa: PLC0415
 
     program = _parse_program(_MULTI_FUNCTION, seed=0)
     universal = make_universal_asset(program, {scheme: _SCHEMES[scheme]}, tmp_path)
-    loaded = _asm(AIModelAsset.load(universal.path).program)
-    graph_names = re.findall(r"coreai\.graph (?:private noinline )?@(\w+)", loaded)
-    expected = ["helper", "main", "prefill", f"main__{scheme}", f"prefill__{scheme}"]
-    assert graph_names == expected
-    main_text = re.search(rf"coreai\.graph @main__{scheme}\(.*?\n}}", loaded, re.S).group(0)
-    assert "coreai.invoke @helper(" in main_text
-    schemes = _scheme_attrs(AIModelAsset.load(universal.path).program)
-    assert _scheme_graphs(schemes[scheme]) == {
-        "main": f"main__{scheme}",
-        "prefill": f"prefill__{scheme}",
+    loaded_program = AIModelAsset.load(universal.path).program
+    cases = _cases(loaded_program, [scheme])
+    assert {key: list(graphs) for key, graphs in cases.items()} == {
+        scheme: ["helper", "main", "prefill"],
+        None: ["helper", "main", "prefill"],
     }
+    assert "coreai.invoke @helper(" in str(cases[scheme]["main"])
     # Both functions read the same weight with the same parameters: one transform.
     ids = [t["id"] for t in universal.schemes[scheme].ir["transforms"]]
     assert ids == [0], ids
+    cases = _cases(universal.program, [scheme])
     keys = [
-        sorted(
-            f"{i}.{role}"
-            for _, _, i, role in _virtual_constants(
-                _graph(universal.program, f"{name}__{scheme}"), scheme
-            )
-        )
+        sorted(f"{i}.{role}" for _, _, i, role in _virtual_constants(cases[scheme][name], scheme))
         for name in ("main", "prefill")
     ]
     assert keys[0] and keys[0] == keys[1]
@@ -246,32 +323,26 @@ coreai.graph @main(%x: tensor<1x32xf16>) -> tensor<1x64xf16> {
 """
 
 
-def test_changed_callee_gets_a_scheme_copy(tmp_path: Path) -> None:
-    """A callee whose weight the scheme compresses is cloned, and its caller calls the clone."""
-    from coreai.authoring import AIModelAsset  # noqa: PLC0415
-
+def test_changed_callee_in_its_case(tmp_path: Path) -> None:
+    """A callee whose weight the scheme compresses has virtual constants in the scheme's case,
+    and its caller there calls it."""
     program = _parse_program(_CHANGED_CALLEE, seed=1)
     universal = make_universal_asset(program, {"w8": _SCHEMES["w8"]}, tmp_path)
-    loaded = _asm(AIModelAsset.load(universal.path).program)
-    graph_names = re.findall(r"coreai\.graph (?:private noinline )?@(\w+)", loaded)
-    assert graph_names == ["helper", "main", "helper__w8", "main__w8"]
-    schemes = _scheme_attrs(AIModelAsset.load(universal.path).program)
-    assert _scheme_graphs(schemes["w8"]) == {"helper": "helper__w8", "main": "main__w8"}
-    main_text = re.search(r"coreai\.graph @main__w8\(.*?\n}", loaded, re.S).group(0)
-    assert "@helper__w8" in main_text and "@helper(" not in main_text
-    assert _virtual_constants(_graph(universal.program, "helper__w8"), "w8")
+    cases = _cases(universal.program, ["w8"])
+    assert "coreai.invoke @helper(" in str(cases["w8"]["main"])
+    assert _virtual_constants(cases["w8"]["helper"], "w8")
+    assert not _virtual_constants(cases[None]["helper"], "w8")
 
 
 def _materialized_constants(module) -> list:
-    """The constant values of `module`'s w8 graph after materialization."""
-    from coreai._compiler.passmanager import PassManager  # noqa: PLC0415
-
+    """The constant values of `module` once the compiler kept and materialized its w8 case."""
     from coreai_opt.coreai_utils._coreai_imports import (  # noqa: PLC0415
         _get_constant_value_as_np_array,
     )
 
-    PassManager.parse("builtin.module(coreai-materialize-weight-transforms{scheme=w8})").run(
-        module.operation
+    _run(
+        module,
+        "resolve-properties{compression-scheme=w8}, coreai-materialize-weight-transforms",
     )
     return [
         _get_constant_value_as_np_array(op)
