@@ -28,6 +28,11 @@ _SCHEMES = {
     "uw8_asym": (quantize_weights, {"dtype": DType.UINT8, "qscheme": QScheme.ASYMMETRIC}),
     "fp8": (quantize_weights, {"dtype": DType.FP8_E4M3FN}),
     "lut4": (palettize_weights, {"n_bits": 4, "lut_dtype": None}),
+    # Blocks of 2048 elements: coreai-opt clusters them with scikit-learn.
+    "lut4_per_channel": (
+        palettize_weights,
+        {"n_bits": 4, "lut_dtype": None, "granularity": CompressionGranularity.PER_CHANNEL},
+    ),
     "lut4_int8_pcs": (
         palettize_weights,
         {
@@ -41,6 +46,7 @@ _SCHEMES = {
     "s50": (sparsify_weights, {"target_sparsity": 0.5}),
     "s50_w8": (sparsify_weights, {"target_sparsity": 0.5, "quantize_dtype": DType.INT8}),
     "s50_lut4": (sparsify_weights, {"target_sparsity": 0.5, "palettize_nbits": 4}),
+    "s2of4": (sparsify_weights, {"target_sparsity": None, "n_m_ratio": (2, 4)}),
 }
 
 
@@ -89,9 +95,26 @@ def test_one_copy_of_each_weight(_universal) -> None:
     program, universal = _universal
     from coreai.authoring import AIModelAsset  # noqa: PLC0415
 
+    def is_lut(op) -> bool:
+        uses = list(op.result.uses)
+        return len(uses) == 1 and (uses[0].owner.name, uses[0].operand_number) == (
+            "coreai.lut_to_dense",
+            1,
+        )
+
     loaded = _asm(AIModelAsset.load(universal.path).program)
     resources = set(re.findall(r"resource_\d+", loaded))
-    assert resources == set(re.findall(r"resource_\d+", _asm(program)))
+    weights = set(re.findall(r"resource_\d+", _asm(program)))
+    # Besides the fp16 weights, only the LUTs that coreai-opt computed ahead of time.
+    luts = {
+        match.group(0)
+        for op in _iter_graph_ops(universal.program)
+        if op.name == "coreai.constant" and is_lut(op)
+        for match in [re.match(r"dense_resource<(resource_\d+)>", str(op.attributes["value"]))]
+        if match
+    }
+    assert weights <= resources
+    assert resources - weights <= {re.sub(r"dense_resource<|>", "", lut) for lut in luts}
     graph_names = re.findall(r"coreai\.graph @(\w+)", loaded)
     assert graph_names == ["main"] + [f"main__{s}" for s in _SCHEMES]
 
@@ -308,3 +331,105 @@ def test_two_universal_assets_in_one_context(tmp_path: Path) -> None:
         assert len(expected) == len(actual)
         for a, b in zip(expected, actual, strict=True):
             np.testing.assert_array_equal(a, b)
+
+
+_RESOURCE = re.compile(r"dense_resource<([^>]*)>")
+_DENSE = re.compile(r"dense<[^>]*>")
+
+
+def _masked(module) -> str:
+    """Module text without payloads; resource names become first-occurrence ids,
+    so which constants share a blob still counts."""
+    text = module.operation.get_asm(enable_debug_info=True, large_elements_limit=16)
+    text = text.split("\n{-#\n")[0]
+    ids: dict[str, int] = {}
+    text = _RESOURCE.sub(lambda m: f"dense_resource<#{ids.setdefault(m.group(1), len(ids))}>", text)
+    return _DENSE.sub("<payload>", text)
+
+
+def _constant_bytes(module) -> list[bytes]:
+    from coreai_opt.coreai_utils.universal import _constant_values  # noqa: PLC0415
+
+    return [
+        _constant_values(op).tobytes()
+        for graph in module.body.operations
+        for op in graph.regions[0].blocks[0].operations
+        if op.name == "coreai.constant"
+    ]
+
+
+@pytest.mark.parametrize("scheme", list(_SCHEMES))
+def test_materialized_graph_is_direct_twin(_universal, scheme: str) -> None:
+    """With the fits done ahead of time, the pass gives coreai-opt's twin bit for bit,
+    also where scikit-learn clustered the weights."""
+    from coreai._compiler.passmanager import PassManager  # noqa: PLC0415
+    from coreai.authoring import AIModelAsset  # noqa: PLC0415
+
+    _, universal = _universal
+    module = AIModelAsset.load(universal.path).program._module._mlir_module
+    with module.context:
+        PassManager.parse(
+            f"builtin.module(coreai-materialize-weight-transforms{{scheme={scheme}}})"
+        ).run(module.operation)
+    twin = AIModelAsset.load(universal.twins[scheme]).program._module._mlir_module
+    assert _masked(module) == _masked(twin)
+    assert _constant_bytes(module) == _constant_bytes(twin)
+
+
+def test_aot_data_of_each_kernel(_universal) -> None:
+    """Palettization keeps coreai-opt's LUTs and gets cluster bounds; magnitude sparsity
+    gets a threshold; quantization and n:m sparsity have no AOT data."""
+    _, universal = _universal
+    attrs = _scheme_attrs(universal.program)
+    for scheme, (fn, kwargs) in _SCHEMES.items():
+        deferred = universal.schemes[scheme]
+        assert not deferred.aot_fallbacks, scheme
+        roles = {
+            role
+            for *_, role in _virtual_constants(_graph(universal.program, f"main__{scheme}"), scheme)
+        }
+        transforms = re.findall(r"#coreai.weight_transform<.*?>(?=, t\d+ =|}>$)", attrs[scheme])
+        assert transforms, scheme
+        if fn is palettize_weights:
+            assert roles == {"indices"}, scheme
+            assert all("aot = {bounds = dense_resource<" in t for t in transforms), scheme
+        elif fn is sparsify_weights and kwargs.get("target_sparsity"):
+            assert all("threshold = dense<" in t for t in transforms), scheme
+            assert "lut" not in roles
+        else:
+            assert "aot =" not in attrs[scheme], scheme
+            assert not deferred.aot
+
+
+def test_without_aot_gives_prototype3_asset(_coreai_program, tmp_path: Path) -> None:
+    program, _, _ = _coreai_program
+    universal = make_universal_asset(program, {"lut4": _SCHEMES["lut4"]}, tmp_path, aot=False)
+    assert "aot =" not in _scheme_attrs(universal.program)["lut4"]
+    roles = {
+        role for *_, role in _virtual_constants(_graph(universal.program, "main__lut4"), "lut4")
+    }
+    assert roles == {"indices", "lut"}
+
+
+@pytest.mark.parametrize("scheme", ["s50_lut4", "lut4"])
+def test_single_cluster_weight(scheme: str, tmp_path: Path) -> None:
+    """A weight whose (kept) values form one cluster has splat-zero indices, which stay
+    an ordinary constant; its AOT data must still be complete."""
+    from coreai._compiler.passmanager import PassManager  # noqa: PLC0415
+    from coreai.authoring import AIModelAsset  # noqa: PLC0415
+
+    weight = "[" + ", ".join("[" + ", ".join(["0.1", "1.0"] * 32) + "]" for _ in range(32)) + "]"
+    text = _MULTI_FUNCTION.split("coreai.graph @prefill", maxsplit=1)[0].replace("WEIGHT", weight)
+    if scheme == "lut4":  # One value only.
+        text = text.replace("0.1", "1.0")
+    program = _parse_program(text, seed=0)
+    universal = make_universal_asset(program, {scheme: _SCHEMES[scheme]}, tmp_path)
+    assert not universal.schemes[scheme].aot_fallbacks
+    module = AIModelAsset.load(universal.path).program._module._mlir_module
+    with module.context:
+        PassManager.parse(
+            f"builtin.module(coreai-materialize-weight-transforms{{scheme={scheme}}})"
+        ).run(module.operation)
+    twin = AIModelAsset.load(universal.twins[scheme]).program._module._mlir_module
+    assert _masked(module) == _masked(twin)
+    assert _constant_bytes(module) == _constant_bytes(twin)
